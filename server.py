@@ -1,7 +1,7 @@
 from pathlib import Path
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify, make_response, g
 from flask_sqlalchemy import SQLAlchemy
-from rich.prompt import Confirm
+import secrets
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///students.db'
@@ -24,131 +24,132 @@ class Score(db.Model):
     sit_ups = db.Column(db.Integer, nullable=False)
     pull_ups = db.Column(db.Integer, nullable=False)
     run_3000m = db.Column(db.Float, nullable=False)
+    def as_dict(self):
+        return {column.name: getattr(self, column.name) for column in self.__table__.columns}
+
+
+sessions = {}
 
 
 def init():
     if not Path('./instance/students.db').exists():
         with app.app_context():
             db.create_all()
-            count: int = -1
-            accounts = int(input('数据库服务器初始化，你需要新建多少个用户？'))
-            if accounts == -1:  # For Debug
-                list_to_add = [User(username='Teacher', password='password', is_teacher=True),
-                               User(username='Student1', password='password'),
-                               User(username='Student2', password='password'),
-                               User(username='Student3', password='password'),
-                               User(username='Student4', password='password'),
-                               User(username='Student5', password='password'),
-                               Score(account_name='Student1', push_ups=17, sit_ups=23, pull_ups=4, run_3000m=13.5 * 60),
-                               Score(account_name='Student2', push_ups=8, sit_ups=14, pull_ups=1, run_3000m=16.2 * 60),
-                               Score(account_name='Student3', push_ups=12, sit_ups=18, pull_ups=2, run_3000m=14.8 * 60),
-                               Score(account_name='Student4', push_ups=5, sit_ups=10, pull_ups=0, run_3000m=17.3 * 60),
-                               Score(account_name='Student5', push_ups=20, sit_ups=25, pull_ups=5, run_3000m=12.8 * 60),
-                               ]
-                for i in list_to_add:
-                    db.session.add(i)
-                db.session.commit()
-                return
+            # Debug initialization
+            db.session.add(User(username='Teacher', password='password', is_teacher=True))
+            db.session.add(User(username='Student1', password='password'))
+            db.session.commit()
 
-            while (count := count + 1) != accounts:
-                username = input('用户名: ')
-                password = input('密码: ')
-                is_teacher = Confirm().ask('是否为老师?', default=False)
-                if username and password:
-                    user = User(username=username, password=password, is_teacher=is_teacher)
-                    db.session.add(user)
-                db.session.commit()
+
+@app.before_request
+def authenticate():
+    g.user = None
+    token = request.cookies.get('session_token')
+    if token and token in sessions:
+        g.user = sessions[token]
+
+
+@app.route('/signin', methods=['POST'])
+def sign_in():
+    data = request.get_json()
+    if not data or 'username' not in data or 'password' not in data:
+        return '缺少参数！', 400
+
+    username = data['username']
+    password = data['password']
+    user = query(User).filter_by(username=username, password=password).first()
+    if user:
+        token = secrets.token_hex(16)
+        sessions[token] = user
+        response = make_response({'message': '登录成功！'})
+        response.set_cookie('session_token', token, max_age=30 * 24 * 3600)  # 30 days
+        return '登录成功！',200
+    return '用户名或密码错误！', 401
+
+
+def teacher_required(func):
+    def wrapper(*args, **kwargs):
+        if not g.user or not g.user.is_teacher:
+            return '认证失败！', 401
+        return func(*args, **kwargs)
+    wrapper.__name__ = func.__name__
+    return wrapper
 
 
 @app.route('/data', methods=['POST'])
+@teacher_required
 def add_data():
-    if query(User).filter_by(username=request.form.get('username'),
-                             password=request.form.get('password'),
-                             is_teacher=True
-                             ).first() is not None:
-        if query(Score).filter_by(account_name=request.form.get('account_name')).first() is not None:
-            return '不能重复添加', 409
-        db.session.add(Score(account_name=request.form.get('account_name'),
-                             push_ups=request.form.get('push_ups'),
-                             sit_ups=request.form.get('sit_ups'),
-                             pull_ups=request.form.get('pull_ups'),
-                             run_3000m=request.form.get('run_3000m')))
-        db.session.commit()
-        return '添加成功', 201
-    else:
-        return '账户的用户名或密码错误导致无权限访问', 401
+    data = request.get_json()
+    required_fields = {'account_name', 'push_ups', 'sit_ups', 'pull_ups', 'run_3000m'}
+    if not data or not required_fields.issubset(data):
+        return '缺少必要参数！', 400
+
+    if query(Score).filter_by(account_name=data['account_name']).first():
+        return '不能重复添加！', 409
+
+    db.session.add(Score(**data))
+    db.session.commit()
+    return '添加成功！', 201
 
 
 @app.route('/data', methods=['PUT'])
+@teacher_required
 def update_data():
-    if query(User).filter_by(username=request.form.get('username'),
-                             password=request.form.get('password'),
-                             is_teacher=True
-                             ).first() is not None:
-        score = query(Score).filter_by(account_name=request.form.get('account_name')).first()
-        if score:
-            score.push_ups = int(request.form.get('push_ups'))
-            score.sit_ups = int(request.form.get('sit_ups'))
-            score.pull_ups = int(request.form.get('pull_ups'))
-            score.run_3000m = float(request.form.get('run_3000m'))
-            db.session.commit()
-            return '成绩更新成功！', 200
-        else:
-            return '找不到该学生的成绩记录！', 404
-    else:
-        return '账户的用户名或密码错误导致无权限访问', 401
+    data = request.get_json()
+    required_fields = {'account_name', 'push_ups', 'sit_ups', 'pull_ups', 'run_3000m'}
+    if not data or not required_fields.issubset(data):
+        return '缺少必要参数！', 400
+
+    score = query(Score).filter_by(account_name=data['account_name']).first()
+    if score:
+        score.push_ups = data['push_ups']
+        score.sit_ups = data['sit_ups']
+        score.pull_ups = data['pull_ups']
+        score.run_3000m = data['run_3000m']
+        db.session.commit()
+        return '成绩更新成功！', 200
+    return '找不到该学生的成绩记录！', 404
 
 
 @app.route('/data', methods=['GET'])
 def query_data():
-    if query(User).filter_by(username=request.form.get('username'),
-                             password=request.form.get('password'),
-                             is_teacher=True
-                             ).first() is not None:
-        score = (query(Score.push_ups, Score.sit_ups, Score.pull_ups, Score.run_3000m)
-                 .filter_by(account_name=request.form.get('account_name')).first())
-        if score is None:
-            return '找不到该学生的成绩记录！', 404
-        return jsonify(list(score)), 200
-    elif query(User).filter_by(username=request.form.get('username'),
-                               password=request.form.get('password'),
-                               ).first() is not None:
-        if request.form.get('username') != request.form.get('account_name'):
-            return '你只能查询你自己的成绩！', 403
-        else:
-            score = (query(Score.push_ups, Score.sit_ups, Score.pull_ups, Score.run_3000m)
-                     .filter_by(account_name=request.form.get('account_name')).first())
-            return jsonify(list(score))
-    else:
-        return '认证失败！', 401
-
-
-@app.route('/data', methods=['DELETE'])
-def del_data():
-    if query(User).filter_by(username=request.form.get('username'),
-                             password=request.form.get('password'),
-                             is_teacher=True
-                             ).first() is not None:
-        data = query(Score).filter_by(account_name=request.form.get('account_name')).first()
-        if data is None:
-            return '找不到该学生的成绩记录！', 404
-        db.session.delete(data)
-        db.session.commit()
-        return '删除成功', 200
-    else:
-        return '删除失败！', 401
+    account_name = request.args.get('account_name')
+    if not account_name:
+        return '缺少参数！', 400
+    if g.user and g.user.is_teacher:
+        score = list(query(Score).filter_by(account_name=account_name).first().as_dict().values())
+        if score:
+            return jsonify(score), 200
+        return '找不到该学生的成绩记录！', 404
+    elif g.user and g.user.username == account_name:
+        score = list(query(Score).filter_by(account_name=account_name).first().as_dict().values())
+        if score:
+            return jsonify(score), 200
+        return '找不到该学生的成绩记录！', 404
+    return '认证失败！', 401
 
 
 @app.route('/get_all_data', methods=['GET'])
+@teacher_required
 def get_all_data():
-    if query(User).filter_by(username=request.form.get('username'),
-                             password=request.form.get('password'),
-                             is_teacher=True
-                             ).first() is not None:
-        datas = query(Score.account_name, Score.push_ups, Score.sit_ups, Score.pull_ups, Score.run_3000m).all()
-        return jsonify([tuple(i) for i in datas]), 200
-    else:
-        return '认证失败！', 401
+    scores = query(Score).all()
+    return jsonify([list(i.as_dict().values()) for  i in scores]), 200
+
+
+@app.route('/data', methods=['DELETE'])
+@teacher_required
+def del_data():
+    account_name = request.args.get('account_name')
+    if not account_name:
+        return '缺少参数！', 400
+
+    score = query(Score).filter_by(account_name=account_name).first()
+    if score:
+        db.session.delete(score)
+        db.session.commit()
+        return '删除成功！', 200
+    return '找不到该学生的成绩记录！', 404
 
 
 init()
+app.run(debug=True)
